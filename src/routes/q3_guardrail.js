@@ -18,26 +18,53 @@ export async function q3GuardrailRoutes(fastify) {
     if (tool === 'bash') {
       const command = String(body.command || '');
 
-      // De-obfuscate string by stripping quotes/escapes for inspection
-      const unquoted = command.replace(/['"\\]/g, '');
-
-      // Strictly target .npmrc access patterns (direct, env vars, tilde, base64)
-      const isTargetingNpmrc =
-        /\.npmrc/i.test(command) ||
-        /\.npmrc/i.test(unquoted) ||
-        /\$HOME\/\.npmrc|\$\{HOME\}\/\.npmrc|~\/\.npmrc/i.test(command) ||
-        /Lm5wbXJj/i.test(command); // base64 for .npmrc
-
-      if (isTargetingNpmrc) {
-        return block('Reading /home/agent/.npmrc is strictly forbidden.');
+      // Decode URI components if URL-encoded
+      let decoded = command;
+      try {
+        decoded = decodeURIComponent(command);
+      } catch (e) {
+        decoded = command;
       }
 
-      // Check explicit /etc/shadow from worked example
-      if (/\/etc\/shadow/i.test(command)) {
+      // Strip shell quotes, backslashes, braces, quotes
+      const unquoted = decoded.replace(/['"\\{}()]/g, '');
+
+      // 1. Check for .npmrc in any form (direct, quote-split, env var, tilde, glob)
+      const npmrcPatterns = [
+        /\.npmrc/i,
+        /\.np[*]rc/i,
+        /\.n[*]rc/i,
+        /npmrc/i,
+        /\$HOME\/\.npmrc|~\/\.npmrc|\$\{HOME\}\/\.npmrc/i,
+        /\/home\/agent\/\.npmrc/i,
+        /Lm5wbXJj|L2hvbWUvYWdlbnQvLm5wbXJj/i // base64 strings for .npmrc or /home/agent/.npmrc
+      ];
+
+      for (const pattern of npmrcPatterns) {
+        if (pattern.test(command) || pattern.test(unquoted)) {
+          return block('Reading /home/agent/.npmrc is strictly forbidden.');
+        }
+      }
+
+      // 2. Path normalization check for any path-like token in command
+      const tokens = command.split(/[\s;;&|><]+/);
+      for (const token of tokens) {
+        if (!token) continue;
+        const cleanToken = token.replace(/['"]+/g, '');
+        if (cleanToken.startsWith('/') || cleanToken.startsWith('.') || cleanToken.startsWith('~')) {
+          let expanded = cleanToken.replace(/^~/, '/home/agent');
+          const resolved = path.resolve('/home/agent/workspace', expanded);
+          if (resolved === '/home/agent/.npmrc') {
+            return block('Reading /home/agent/.npmrc is strictly forbidden.');
+          }
+        }
+      }
+
+      // 3. Worked example check
+      if (command.includes('/etc/shadow')) {
         return block('Reading /etc/shadow is never permitted by this agent\'s policy.');
       }
 
-      // Allow all other commands / legitimate reads
       return allow('Command execution allowed.');
     }
 
@@ -47,15 +74,25 @@ export async function q3GuardrailRoutes(fastify) {
     if (tool === 'write_file') {
       const rawPath = String(body.path || '');
 
-      // Resolve relative path against working directory /home/agent/workspace
-      const resolvedFromWorkdir = path.resolve('/home/agent/workspace', rawPath);
-      
-      // Also resolve assuming /workspace relative root if provided like 'output/...'
-      const resolvedFromWorkspace = path.resolve('/workspace', rawPath);
+      // Resolve relative paths against working directory /home/agent/workspace
+      // or /workspace if path explicitly targets /workspace
+      let resolvedPath;
+      if (path.isAbsolute(rawPath)) {
+        resolvedPath = path.normalize(rawPath);
+      } else {
+        resolvedPath = path.resolve('/home/agent/workspace', rawPath);
+      }
 
-      const isInsideOutput = (p) => p === '/workspace/output' || p.startsWith('/workspace/output/');
+      // Also normalize if rawPath starts with /workspace or output/
+      let altResolved = path.resolve('/workspace', rawPath);
 
-      if (isInsideOutput(resolvedFromWorkdir) || isInsideOutput(resolvedFromWorkspace)) {
+      // Check if resolved path is strictly inside /workspace/output/
+      const isPermitted = (p) => {
+        const normalized = path.normalize(p);
+        return normalized.startsWith('/workspace/output/');
+      };
+
+      if (isPermitted(resolvedPath) || isPermitted(altResolved)) {
         return allow('File write permitted in designated output directory.');
       }
 
