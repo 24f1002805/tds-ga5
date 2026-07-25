@@ -1,4 +1,3 @@
-// src/routes/q3_guardrails.js (or src/routes/q3_guardrail.js)
 import path from 'path';
 
 export async function q3GuardrailRoutes(fastify) {
@@ -18,20 +17,40 @@ export async function q3GuardrailRoutes(fastify) {
     if (tool === 'bash') {
       const command = String(body.command || '');
 
-      // Normalize string for obfuscation checks (remove quotes, extra spaces)
+      // Sanitize/unquote command to detect string fragmentation (.n''pmrc, "np"mr'c')
       const sanitized = command.replace(/['"\\]/g, '');
 
-      // Check for .npmrc secret access (direct, env vars, tilde, base64, path traversal)
-      const npmrcDirect = /\.npmrc/i;
-      const base64Npmrc = /Lm5wbXJj/; // base64 for .npmrc
+      // Checks for .npmrc variants
+      const npmrcRegex = /\.npmrc|npmrc/i;
+      const homeEnvRegex = /\$HOME\/\.npmrc|\$\{HOME\}\/\.npmrc|~\/\.npmrc/i;
+      const base64Npmrc = /Lm5wbXJj|Lm5wbXJj/i; // base64 representation of .npmrc
 
-      if (npmrcDirect.test(command) || npmrcDirect.test(sanitized) || base64Npmrc.test(command)) {
+      if (
+        npmrcRegex.test(command) ||
+        npmrcRegex.test(sanitized) ||
+        homeEnvRegex.test(command) ||
+        base64Npmrc.test(command)
+      ) {
         return block('Reading /home/agent/.npmrc is strictly forbidden.');
       }
 
-      // Check for /etc/shadow or /etc/passwd
-      if (/\/etc\/shadow|\/etc\/passwd/i.test(command) || /\/etc\/shadow|\/etc\/passwd/i.test(sanitized)) {
-        return block('Accessing system sensitive files is forbidden.');
+      // Check if command resolves to /home/agent/.npmrc via path normalization
+      const tokens = command.split(/\s+/);
+      for (const token of tokens) {
+        if (token.includes('npmrc')) {
+          return block('Access to .npmrc is forbidden.');
+        }
+        if (token.startsWith('/') || token.startsWith('.')) {
+          const resolved = path.resolve('/home/agent/workspace', token);
+          if (resolved === '/home/agent/.npmrc') {
+            return block('Reading /home/agent/.npmrc is strictly forbidden.');
+          }
+        }
+      }
+
+      // Worked example check
+      if (command.includes('/etc/shadow')) {
+        return block('Reading /etc/shadow is never permitted by this agent\'s policy.');
       }
 
       return allow('Command execution allowed.');
@@ -43,23 +62,26 @@ export async function q3GuardrailRoutes(fastify) {
     if (tool === 'write_file') {
       const targetPath = String(body.path || '');
 
-      // The allowed directory is strictly /workspace/output/
-      // Paths can be specified relative to /home/agent/workspace, /workspace, or absolute
+      // Resolve relative paths against working directory /home/agent/workspace
       let resolvedPath;
-
       if (path.isAbsolute(targetPath)) {
         resolvedPath = path.normalize(targetPath);
       } else {
-        // Resolve relative to /workspace/output if starting with output/, or workspace root
+        // If path starts with output/, treat it relative to /workspace/output/
         if (targetPath.startsWith('output/')) {
           resolvedPath = path.normalize('/workspace/' + targetPath);
         } else {
-          resolvedPath = path.resolve('/workspace/output', targetPath);
+          resolvedPath = path.resolve('/home/agent/workspace', targetPath);
         }
       }
 
-      // Must be strictly inside /workspace/output/
-      if (resolvedPath === '/workspace/output' || resolvedPath.startsWith('/workspace/output/')) {
+      // Strictly check if resolved path is inside /workspace/output
+      const allowedPrefix = '/workspace/output';
+      const isAllowed =
+        resolvedPath === allowedPrefix ||
+        resolvedPath.startsWith(allowedPrefix + '/');
+
+      if (isAllowed) {
         return allow('File write permitted in designated output directory.');
       }
 
@@ -75,7 +97,6 @@ export async function q3GuardrailRoutes(fastify) {
       try {
         const parsedUrl = new URL(rawUrl);
         const hostname = parsedUrl.hostname.toLowerCase();
-
         const allowedHosts = ['registry.npmjs.org', 'raw.githubusercontent.com'];
 
         if (!allowedHosts.includes(hostname)) {
@@ -92,5 +113,4 @@ export async function q3GuardrailRoutes(fastify) {
   });
 }
 
-// Export alias to match index.js import
 export const q3GuardrailsRoutes = q3GuardrailRoutes;
