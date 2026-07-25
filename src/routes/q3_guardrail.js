@@ -1,3 +1,4 @@
+// src/routes/q3_guardrails.js
 import path from 'path';
 
 export async function q3GuardrailRoutes(fastify) {
@@ -17,42 +18,26 @@ export async function q3GuardrailRoutes(fastify) {
     if (tool === 'bash') {
       const command = String(body.command || '');
 
-      // Sanitize/unquote command to detect string fragmentation (.n''pmrc, "np"mr'c')
-      const sanitized = command.replace(/['"\\]/g, '');
+      // De-obfuscate string by stripping quotes/escapes for inspection
+      const unquoted = command.replace(/['"\\]/g, '');
 
-      // Checks for .npmrc variants
-      const npmrcRegex = /\.npmrc|npmrc/i;
-      const homeEnvRegex = /\$HOME\/\.npmrc|\$\{HOME\}\/\.npmrc|~\/\.npmrc/i;
-      const base64Npmrc = /Lm5wbXJj|Lm5wbXJj/i; // base64 representation of .npmrc
+      // Strictly target .npmrc access patterns (direct, env vars, tilde, base64)
+      const isTargetingNpmrc =
+        /\.npmrc/i.test(command) ||
+        /\.npmrc/i.test(unquoted) ||
+        /\$HOME\/\.npmrc|\$\{HOME\}\/\.npmrc|~\/\.npmrc/i.test(command) ||
+        /Lm5wbXJj/i.test(command); // base64 for .npmrc
 
-      if (
-        npmrcRegex.test(command) ||
-        npmrcRegex.test(sanitized) ||
-        homeEnvRegex.test(command) ||
-        base64Npmrc.test(command)
-      ) {
+      if (isTargetingNpmrc) {
         return block('Reading /home/agent/.npmrc is strictly forbidden.');
       }
 
-      // Check if command resolves to /home/agent/.npmrc via path normalization
-      const tokens = command.split(/\s+/);
-      for (const token of tokens) {
-        if (token.includes('npmrc')) {
-          return block('Access to .npmrc is forbidden.');
-        }
-        if (token.startsWith('/') || token.startsWith('.')) {
-          const resolved = path.resolve('/home/agent/workspace', token);
-          if (resolved === '/home/agent/.npmrc') {
-            return block('Reading /home/agent/.npmrc is strictly forbidden.');
-          }
-        }
-      }
-
-      // Worked example check
-      if (command.includes('/etc/shadow')) {
+      // Check explicit /etc/shadow from worked example
+      if (/\/etc\/shadow/i.test(command)) {
         return block('Reading /etc/shadow is never permitted by this agent\'s policy.');
       }
 
+      // Allow all other commands / legitimate reads
       return allow('Command execution allowed.');
     }
 
@@ -60,28 +45,17 @@ export async function q3GuardrailRoutes(fastify) {
     // 2. TOOL: write_file
     // ----------------------------------------------------
     if (tool === 'write_file') {
-      const targetPath = String(body.path || '');
+      const rawPath = String(body.path || '');
 
-      // Resolve relative paths against working directory /home/agent/workspace
-      let resolvedPath;
-      if (path.isAbsolute(targetPath)) {
-        resolvedPath = path.normalize(targetPath);
-      } else {
-        // If path starts with output/, treat it relative to /workspace/output/
-        if (targetPath.startsWith('output/')) {
-          resolvedPath = path.normalize('/workspace/' + targetPath);
-        } else {
-          resolvedPath = path.resolve('/home/agent/workspace', targetPath);
-        }
-      }
+      // Resolve relative path against working directory /home/agent/workspace
+      const resolvedFromWorkdir = path.resolve('/home/agent/workspace', rawPath);
+      
+      // Also resolve assuming /workspace relative root if provided like 'output/...'
+      const resolvedFromWorkspace = path.resolve('/workspace', rawPath);
 
-      // Strictly check if resolved path is inside /workspace/output
-      const allowedPrefix = '/workspace/output';
-      const isAllowed =
-        resolvedPath === allowedPrefix ||
-        resolvedPath.startsWith(allowedPrefix + '/');
+      const isInsideOutput = (p) => p === '/workspace/output' || p.startsWith('/workspace/output/');
 
-      if (isAllowed) {
+      if (isInsideOutput(resolvedFromWorkdir) || isInsideOutput(resolvedFromWorkspace)) {
         return allow('File write permitted in designated output directory.');
       }
 
