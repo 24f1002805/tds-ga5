@@ -3,43 +3,62 @@ export async function q2ProrationRoutes(fastify) {
   fastify.post('/v1/prorate', async (req, reply) => {
     const body = req.body || {};
 
-    // 1. Extract spec (defaulting to v1 if unspecified)
-    const spec = (body.spec || 'v1').toLowerCase();
+    // 1. Determine Spec ("v1" or "v2")
+    const spec = String(body.spec || 'v1').toLowerCase().trim();
 
-    // 2. Extract base charge / amount
+    // 2. Extract Base Charge / Total Amount
     const baseCharge = Number(
-      body.base_charge ?? body.baseCharge ?? body.amount ?? body.totalAmount ?? 0
+      body.base_charge ?? body.baseCharge ?? body.amount ?? body.total_amount ?? body.totalAmount ?? body.price ?? 0
     );
 
-    // 3. Extract usage/active days vs total days in month
-    let activeDays = Number(
-      body.active_days ?? body.activeDays ?? body.days_used ?? body.remainingDays ?? 0
-    );
-    let daysInMonth = Number(
-      body.days_in_actual_month ?? body.daysInActualMonth ?? body.days_in_month ?? 30
+    // 3. Extract Divisor
+    let divisor = 30; // Default for v1
+    const actualMonthDays = Number(
+      body.days_in_actual_month ?? body.daysInActualMonth ?? body.days_in_month ?? body.total_days ?? 30
     );
 
-    // If dates are provided instead of raw day counts:
-    if (!activeDays && (body.startDate || body.start_date) && (body.effectiveDate || body.effective_date)) {
-      const start = new Date(body.startDate || body.start_date);
-      const end = new Date(body.endDate || body.end_date);
-      const effective = new Date(body.effectiveDate || body.effective_date);
-
-      daysInMonth = Math.max(1, Math.ceil((end - start) / (1000 * 60 * 60 * 24)));
-      activeDays = Math.max(0, Math.ceil((end - effective) / (1000 * 60 * 60 * 24)));
-    }
-
-    // 4. Branch based on spec rule
-    let divisor = 30; // Default v1 rule
     if (spec === 'v2') {
-      divisor = Number(body.days_in_actual_month ?? body.daysInActualMonth ?? daysInMonth ?? 30);
+      divisor = actualMonthDays > 0 ? actualMonthDays : 30;
+    } else {
+      divisor = 30; // Force exactly 30 for v1
     }
 
-    // Prevent divide-by-zero
-    if (divisor <= 0) divisor = 30;
+    // 4. Extract Active / Used Days
+    let activeDays = null;
 
-    // 5. Calculate charge
-    const charge = Number(((baseCharge / divisor) * activeDays).toFixed(2));
+    if (body.active_days !== undefined) activeDays = Number(body.active_days);
+    else if (body.days_used !== undefined) activeDays = Number(body.days_used);
+    else if (body.used_days !== undefined) activeDays = Number(body.used_days);
+    else if (body.remaining_days !== undefined) activeDays = Number(body.remaining_days);
+
+    // If activeDays wasn't directly passed, compute from dates
+    if (activeDays === null) {
+      const startStr = body.start_date || body.startDate || body.billing_cycle_start;
+      const endStr = body.end_date || body.endDate || body.billing_cycle_end;
+      const effectiveStr = body.effective_date || body.effectiveDate || body.change_date || body.cancel_date;
+
+      if (startStr && effectiveStr) {
+        const start = new Date(startStr);
+        const effective = new Date(effectiveStr);
+        const end = endStr ? new Date(endStr) : null;
+
+        // Calculate days between effective date and end date (or start date and effective date)
+        const msPerDay = 1000 * 60 * 60 * 24;
+        if (end && effective <= end) {
+          activeDays = Math.round((end - effective) / msPerDay);
+        } else {
+          activeDays = Math.round((effective - start) / msPerDay);
+        }
+      }
+    }
+
+    if (activeDays === null || isNaN(activeDays)) {
+      activeDays = 0;
+    }
+
+    // 5. Calculate Charge
+    const rawCharge = (baseCharge / divisor) * activeDays;
+    const charge = Math.round(rawCharge * 100) / 100;
 
     return reply.type('application/json').send({
       charge: charge
