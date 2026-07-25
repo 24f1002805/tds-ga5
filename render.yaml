@@ -1,0 +1,15 @@
+services:
+  - type: web
+    name: ga5-agent-suite
+    env: docker
+    plan: free
+    region: singapore
+    buildCommand: docker build -t ga5-agent-suite .
+    startCommand: npm start
+    envVars:
+      - key: DATABASE_PATH
+        value: /var/data/agent_state.db
+    disk:
+      name: sqlite-data
+      mountPath: /var/data
+      sizeGB: 1
