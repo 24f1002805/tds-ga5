@@ -1,7 +1,10 @@
-// src/routes/q5_run_control.js
+// src/routes/q5_loopguard.js
 
 /**
  * Normalizes and canonicalizes step arguments for exact comparison.
+ * - Removes fields named "client_ts"
+ * - Normalizes string whitespace (trims and collapses internal whitespace)
+ * - Sorts object keys deterministically
  */
 function canonicalizeArgs(obj) {
   if (obj === null || typeof obj !== 'object') {
@@ -16,7 +19,7 @@ function canonicalizeArgs(obj) {
   }
 
   const sortedKeys = Object.keys(obj)
-    .filter(key => key !== 'client_ts') // Drop client_ts
+    .filter(key => key !== 'client_ts')
     .sort();
 
   const canonicalObj = {};
@@ -27,13 +30,13 @@ function canonicalizeArgs(obj) {
   return JSON.stringify(canonicalObj);
 }
 
-export async function q5RunControlRoutes(fastify) {
-  fastify.post('/v1/run-control', async (req, reply) => {
+export async function q5LoopGuardRoutes(fastify) {
+  // Support both /v1/run-control and /v1/loop-guard endpoints
+  const handler = async (req, reply) => {
     const body = req.body || {};
     const budgetTokens = Number(body.budget_tokens ?? 34000);
     const steps = Array.isArray(body.steps) ? body.steps : [];
 
-    // Helper functions
     const halt = (reason) => reply.type('application/json').send({ decision: 'halt', reason });
     const continueRun = (reason) => reply.type('application/json').send({ decision: 'continue', reason });
 
@@ -43,7 +46,7 @@ export async function q5RunControlRoutes(fastify) {
     const totalTokensUsed = steps.reduce((sum, step) => sum + Number(step.tokens_used || 0), 0);
 
     if (totalTokensUsed >= budgetTokens) {
-      return halt(`Cumulative tokens_used (${totalTokensUsed}) has reached or exceeded the budget (${budgetTokens}).`);
+      return halt(`Cumulative tokens_used (${totalTokensUsed}) reached or exceeded the budget (${budgetTokens}).`);
     }
 
     // ----------------------------------------------------
@@ -73,7 +76,7 @@ export async function q5RunControlRoutes(fastify) {
         return halt(`Same tool '${last1.tool}' was called 3 consecutive times with identical arguments.`);
       }
 
-      // Rule B: 2-step cycle (A, B, A, B, A, B) across last 6 steps
+      // Rule B: 2-step cycle (A, B, A, B, A, B) across trailing 6 steps
       if (n >= 6) {
         const s1 = processedSteps[n - 6];
         const s2 = processedSteps[n - 5];
@@ -95,5 +98,8 @@ export async function q5RunControlRoutes(fastify) {
     }
 
     return continueRun('Run is within budget and no execution loops were detected.');
-  });
+  };
+
+  fastify.post('/v1/run-control', handler);
+  fastify.post('/v1/loop-guard', handler);
 }
