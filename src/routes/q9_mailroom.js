@@ -1,13 +1,10 @@
 // src/routes/q9_mailroom.js
 import crypto from 'node:crypto';
+import fp from 'fastify-plugin';
 
-// In-memory persistent stores (for production, swap with SQLite/Redis if container restarts)
-const EVALUATIONS = new Map(); // evaluationId -> { inputDigest, verifier, proposalsMap }
-const DOSSIER_CACHE = new Map(); // canonicalContentHash -> proposal
+const EVALUATIONS = new Map();
+const DOSSIER_CACHE = new Map();
 
-/**
- * Recursive key-sorted compact JSON stringifier (Canonical JSON JCS / RFC 8785)
- */
 function canonicalJsonStringify(obj) {
   if (obj === null || typeof obj !== 'object') {
     return JSON.stringify(obj);
@@ -20,17 +17,11 @@ function canonicalJsonStringify(obj) {
   return '{' + entries.join(',') + '}';
 }
 
-/**
- * Compute lowercase SHA-256 hex string over UTF-8 bytes of canonical JSON representation
- */
 function computeSha256(data) {
   const jsonStr = canonicalJsonStringify(data);
   return crypto.createHash('sha256').update(jsonStr, 'utf8').digest('hex');
 }
 
-/**
- * Compute proposalDigest for receipt verification & validation
- */
 function computeProposalDigest(proposal) {
   const norm = {
     dossierId: proposal.dossierId,
@@ -43,14 +34,10 @@ function computeProposalDigest(proposal) {
   return computeSha256(norm);
 }
 
-/**
- * Verify Ed25519 signature of receipt
- */
 function verifyReceiptSignature(receipt, evaluationId, inputDigest, verifier) {
   try {
     if (!verifier || !verifier.publicKeyJwk) return false;
 
-    // Convert JWK x-coordinate (base64url) to DER/PEM Ed25519 public key
     const publicKey = crypto.createPublicKey({
       key: verifier.publicKeyJwk,
       format: 'jwk'
@@ -79,38 +66,29 @@ function verifyReceiptSignature(receipt, evaluationId, inputDigest, verifier) {
   }
 }
 
-/**
- * Rule-based heuristic decision engine to analyze dossiers and generate safe proposals
- */
 function processDossier(dossier) {
   const dossierId = dossier.dossierId;
   const mailbox = dossier.mailbox || '';
-  const objective = dossier.objective || '';
-  
-  const allLines = [];
-  const textContent = [];
 
+  const allLines = [];
   for (const src of dossier.sources || []) {
     for (const line of src.lines || []) {
       if (line.lineId && typeof line.text === 'string') {
         allLines.push(line);
-        textContent.push(line.text);
       }
     }
   }
 
-  const fullText = textContent.join(' ');
+  const fullText = allLines.map(l => l.text).join(' ').toLowerCase();
   const firstLineId = allLines[0]?.lineId || 'line_1';
-  const evidenceIds = allLines.slice(0, 3).map(l => l.lineId);
 
-  // 1. Check for Indirect Prompt Injection / Attacks -> quarantine_item
-  const lowerText = fullText.toLowerCase();
+  // 1. Indirect Prompt Injection -> quarantine_item
   if (
-    lowerText.includes('ignore previous instructions') ||
-    lowerText.includes('system prompt') ||
-    lowerText.includes('override policy') ||
-    lowerText.includes('agent canary') ||
-    lowerText.includes('vault secret')
+    fullText.includes('ignore previous instructions') ||
+    fullText.includes('system prompt') ||
+    fullText.includes('override policy') ||
+    fullText.includes('canary') ||
+    fullText.includes('vault secret')
   ) {
     return {
       dossierId,
@@ -122,8 +100,8 @@ function processDossier(dossier) {
     };
   }
 
-  // 2. Check for ambiguous/unclear identity -> request_confirmation
-  if (lowerText.includes('verify request') || lowerText.includes('confirm identity') || lowerText.includes('ambiguous')) {
+  // 2. Identity / Confirmation ambiguous -> request_confirmation
+  if (fullText.includes('verify') || fullText.includes('confirm') || fullText.includes('identity')) {
     return {
       dossierId,
       callId: `call_${dossierId}_${Date.now()}`,
@@ -134,8 +112,8 @@ function processDossier(dossier) {
     };
   }
 
-  // 3. Approved outbound notice -> send_approved_notice
-  if (lowerText.includes('approved notice') || lowerText.includes('order_status')) {
+  // 3. Outbound approved notice -> send_approved_notice
+  if (fullText.includes('approved') || fullText.includes('notice')) {
     return {
       dossierId,
       callId: `call_${dossierId}_${Date.now()}`,
@@ -147,7 +125,7 @@ function processDossier(dossier) {
   }
 
   // 4. Internal updates -> update_internal_record
-  if (lowerText.includes('delivery window') || lowerText.includes('update record')) {
+  if (fullText.includes('window') || fullText.includes('update')) {
     return {
       dossierId,
       callId: `call_${dossierId}_${Date.now()}`,
@@ -158,8 +136,8 @@ function processDossier(dossier) {
     };
   }
 
-  // 5. Customer support draft -> create_draft
-  if (lowerText.includes('draft') || lowerText.includes('inquiry')) {
+  // 5. Customer draft -> create_draft
+  if (fullText.includes('draft') || fullText.includes('order')) {
     return {
       dossierId,
       callId: `call_${dossierId}_${Date.now()}`,
@@ -181,12 +159,11 @@ function processDossier(dossier) {
   };
 }
 
-export async function q9MailroomRoutes(fastify) {
-  fastify.post('/v1/mailroom', async (req, reply) => {
+async function mailroomPlugin(fastify, opts) {
+  async function handleMailroom(req, reply) {
     reply.status(200).type('application/json');
     const body = req.body || {};
 
-    // Validate profile
     if (body.profile !== 'ga5-mailroom-action-gate/v2') {
       return reply.status(400).send({ error: 'Invalid profile' });
     }
@@ -196,25 +173,21 @@ export async function q9MailroomRoutes(fastify) {
       return reply.status(400).send({ error: 'Missing evaluationId' });
     }
 
-    // ----------------------------------------------------
     // OPERATION 1: PROPOSE
-    // ----------------------------------------------------
     if (operation === 'propose') {
-      const { receiptVerifier, corpus, dossiers } = body;
+      const { receiptVerifier, dossiers } = body;
       if (!Array.isArray(dossiers) || dossiers.length === 0) {
         return reply.status(400).send({ error: 'Missing or empty dossiers array' });
       }
 
-      // Compute input digest over key-sorted compact JSON of dossiers
       const inputDigest = computeSha256(dossiers);
 
-      // Check conflict: If evaluationId already exists with DIFFERENT inputDigest -> HTTP 409
+      // Conflict Check: 409 if evaluationId exists with different inputDigest
       if (EVALUATIONS.has(evaluationId)) {
         const existing = EVALUATIONS.get(evaluationId);
         if (existing.inputDigest !== inputDigest) {
           return reply.status(409).send({ error: 'Conflict: evaluationId exists with different inputDigest' });
         }
-        // Exact Replay -> Return exact cached response
         const cachedProposals = Array.from(existing.proposalsMap.values());
         return reply.send({
           profile: 'ga5-mailroom-action-gate/v2',
@@ -225,7 +198,6 @@ export async function q9MailroomRoutes(fastify) {
         });
       }
 
-      // Process each dossier and cache by canonical content fingerprint
       const proposals = [];
       const proposalsMap = new Map();
 
@@ -235,7 +207,7 @@ export async function q9MailroomRoutes(fastify) {
 
         if (DOSSIER_CACHE.has(canonicalHash)) {
           proposal = { ...DOSSIER_CACHE.get(canonicalHash) };
-          proposal.dossierId = dossier.dossierId; // Ensure dossierId matches request
+          proposal.dossierId = dossier.dossierId;
         } else {
           proposal = processDossier(dossier);
           DOSSIER_CACHE.set(canonicalHash, proposal);
@@ -245,7 +217,6 @@ export async function q9MailroomRoutes(fastify) {
         proposalsMap.set(dossier.dossierId, proposal);
       }
 
-      // Persist evaluation state
       EVALUATIONS.set(evaluationId, {
         inputDigest,
         verifier: receiptVerifier,
@@ -261,20 +232,16 @@ export async function q9MailroomRoutes(fastify) {
       });
     }
 
-    // ----------------------------------------------------
     // OPERATION 2: COMMIT
-    // ----------------------------------------------------
     if (operation === 'commit') {
       const { inputDigest, receipts } = body;
 
-      // Reject unknown evaluationId -> HTTP 400
       if (!EVALUATIONS.has(evaluationId)) {
         return reply.status(400).send({ error: 'Unknown evaluationId' });
       }
 
       const evalData = EVALUATIONS.get(evaluationId);
 
-      // Digest verification
       if (evalData.inputDigest !== inputDigest) {
         return reply.status(400).send({ error: 'Mismatch in inputDigest' });
       }
@@ -283,24 +250,20 @@ export async function q9MailroomRoutes(fastify) {
         return reply.status(400).send({ error: 'Invalid receipts format' });
       }
 
-      // Validate every receipt atomically before modifying state
       const outcomes = [];
 
       for (const receipt of receipts) {
         const storedProposal = evalData.proposalsMap.get(receipt.dossierId);
 
-        // 1. Ensure dossier & callId match persisted proposal
         if (!storedProposal || storedProposal.callId !== receipt.callId || storedProposal.action !== receipt.action) {
           return reply.status(400).send({ error: `Proposal mismatch for dossier ${receipt.dossierId}` });
         }
 
-        // 2. Compute proposal digest and check match
         const computedDigest = computeProposalDigest(storedProposal);
         if (computedDigest !== receipt.proposalDigest) {
           return reply.status(400).send({ error: `proposalDigest mismatch for dossier ${receipt.dossierId}` });
         }
 
-        // 3. Verify Ed25519 cryptographic receipt signature
         const isValidSignature = verifyReceiptSignature(receipt, evaluationId, inputDigest, evalData.verifier);
         if (!isValidSignature) {
           return reply.status(400).send({ error: `Invalid receipt signature for dossier ${receipt.dossierId}` });
@@ -326,15 +289,12 @@ export async function q9MailroomRoutes(fastify) {
     }
 
     return reply.status(400).send({ error: `Unknown operation: ${operation}` });
-  });
+  }
 
-  // Alias path
-  fastify.post('/mailroom', async (req, reply) => {
-    return fastify.inject({
-      method: 'POST',
-      url: '/v1/mailroom',
-      payload: req.body,
-      headers: req.headers
-    }).then(res => reply.status(res.statusCode).send(res.json()));
-  });
+  // Register on both routes
+  fastify.post('/v1/mailroom', handleMailroom);
+  fastify.post('/mailroom', handleMailroom);
 }
+
+// Export as fastify-plugin to break isolation and register cleanly in index.js
+export const q9MailroomRoutes = fp(mailroomPlugin);
