@@ -15,6 +15,17 @@ const fastify = Fastify({
   bodyLimit: 786432
 });
 
+// Register global content-type parser for A2A and GA5 vendor-specific JSON media types
+fastify.addContentTypeParser(/^application\/(a2a|vnd\.ga5\..*)\+json$/, { parseAs: 'string' }, (req, body, done) => {
+  try {
+    const json = typeof body === 'string' && body.trim() !== '' ? JSON.parse(body) : body || {};
+    done(null, json);
+  } catch (err) {
+    err.statusCode = 400;
+    done(err, undefined);
+  }
+});
+
 fastify.get('/', async () => ({ status: 'ok', service: 'GA5 Master Agent Suite' }));
 
 async function start() {
