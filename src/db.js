@@ -39,6 +39,16 @@ export async function initDb() {
       msgHash TEXT NOT NULL
     );
 
+    -- Q10 Performance Indexes for User Isolation & Idempotency Lookups
+    CREATE INDEX IF NOT EXISTS idx_q10_principal_msg ON q10_tasks(principal, msgHash);
+    CREATE INDEX IF NOT EXISTS idx_q10_principal ON q10_tasks(principal);
+
+    -- Q10 Semantic Package Cache (Prevents repeat model work across Check/Save runs)
+    CREATE TABLE IF NOT EXISTS q10_package_cache (
+      pkgHash TEXT PRIMARY KEY,
+      decisionJson TEXT NOT NULL
+    );
+
     -- Q11 State Storage
     CREATE TABLE IF NOT EXISTS q11_runs (
       runId TEXT PRIMARY KEY,
