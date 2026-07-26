@@ -158,139 +158,148 @@ function processDossier(dossier) {
   };
 }
 
-export async function q9MailroomRoutes(fastify, opts) {
-  async function handleMailroom(req, reply) {
-    reply.status(200).type('application/json');
-    const body = req.body || {};
+async function handleMailroom(req, reply) {
+  reply.type('application/json');
+  const body = req.body || {};
 
-    if (body.profile !== 'ga5-mailroom-action-gate/v2') {
-      return reply.status(400).send({ error: 'Invalid profile' });
+  if (body.profile !== 'ga5-mailroom-action-gate/v2') {
+    return reply.status(400).send({ error: 'Invalid profile' });
+  }
+
+  const { operation, evaluationId } = body;
+  if (!evaluationId) {
+    return reply.status(400).send({ error: 'Missing evaluationId' });
+  }
+
+  // OPERATION 1: PROPOSE
+  if (operation === 'propose') {
+    const { receiptVerifier, dossiers } = body;
+    if (!Array.isArray(dossiers) || dossiers.length === 0) {
+      return reply.status(400).send({ error: 'Missing or empty dossiers array' });
     }
 
-    const { operation, evaluationId } = body;
-    if (!evaluationId) {
-      return reply.status(400).send({ error: 'Missing evaluationId' });
-    }
+    const inputDigest = computeSha256(dossiers);
 
-    // OPERATION 1: PROPOSE
-    if (operation === 'propose') {
-      const { receiptVerifier, dossiers } = body;
-      if (!Array.isArray(dossiers) || dossiers.length === 0) {
-        return reply.status(400).send({ error: 'Missing or empty dossiers array' });
+    // Conflict Check
+    if (EVALUATIONS.has(evaluationId)) {
+      const existing = EVALUATIONS.get(evaluationId);
+      if (existing.inputDigest !== inputDigest) {
+        return reply.status(409).send({ error: 'Conflict: evaluationId exists with different inputDigest' });
       }
-
-      const inputDigest = computeSha256(dossiers);
-
-      // Conflict Check: 409 if evaluationId exists with different inputDigest
-      if (EVALUATIONS.has(evaluationId)) {
-        const existing = EVALUATIONS.get(evaluationId);
-        if (existing.inputDigest !== inputDigest) {
-          return reply.status(409).send({ error: 'Conflict: evaluationId exists with different inputDigest' });
-        }
-        const cachedProposals = Array.from(existing.proposalsMap.values());
-        return reply.send({
-          profile: 'ga5-mailroom-action-gate/v2',
-          evaluationId,
-          status: 'awaiting_receipts',
-          inputDigest,
-          proposals: cachedProposals
-        });
-      }
-
-      const proposals = [];
-      const proposalsMap = new Map();
-
-      for (const dossier of dossiers) {
-        const canonicalHash = computeSha256(dossier);
-        let proposal;
-
-        if (DOSSIER_CACHE.has(canonicalHash)) {
-          proposal = { ...DOSSIER_CACHE.get(canonicalHash) };
-          proposal.dossierId = dossier.dossierId;
-        } else {
-          proposal = processDossier(dossier);
-          DOSSIER_CACHE.set(canonicalHash, proposal);
-        }
-
-        proposals.push(proposal);
-        proposalsMap.set(dossier.dossierId, proposal);
-      }
-
-      EVALUATIONS.set(evaluationId, {
-        inputDigest,
-        verifier: receiptVerifier,
-        proposalsMap
-      });
-
-      return reply.send({
+      const cachedProposals = Array.from(existing.proposalsMap.values());
+      return reply.status(200).send({
         profile: 'ga5-mailroom-action-gate/v2',
         evaluationId,
         status: 'awaiting_receipts',
         inputDigest,
-        proposals
+        proposals: cachedProposals
       });
     }
 
-    // OPERATION 2: COMMIT
-    if (operation === 'commit') {
-      const { inputDigest, receipts } = body;
+    const proposals = [];
+    const proposalsMap = new Map();
 
-      if (!EVALUATIONS.has(evaluationId)) {
-        return reply.status(400).send({ error: 'Unknown evaluationId' });
+    for (const dossier of dossiers) {
+      const canonicalHash = computeSha256(dossier);
+      let proposal;
+
+      if (DOSSIER_CACHE.has(canonicalHash)) {
+        proposal = { ...DOSSIER_CACHE.get(canonicalHash) };
+        proposal.dossierId = dossier.dossierId;
+      } else {
+        proposal = processDossier(dossier);
+        DOSSIER_CACHE.set(canonicalHash, proposal);
       }
 
-      const evalData = EVALUATIONS.get(evaluationId);
-
-      if (evalData.inputDigest !== inputDigest) {
-        return reply.status(400).send({ error: 'Mismatch in inputDigest' });
-      }
-
-      if (!Array.isArray(receipts)) {
-        return reply.status(400).send({ error: 'Invalid receipts format' });
-      }
-
-      const outcomes = [];
-
-      for (const receipt of receipts) {
-        const storedProposal = evalData.proposalsMap.get(receipt.dossierId);
-
-        if (!storedProposal || storedProposal.callId !== receipt.callId || storedProposal.action !== receipt.action) {
-          return reply.status(400).send({ error: `Proposal mismatch for dossier ${receipt.dossierId}` });
-        }
-
-        const computedDigest = computeProposalDigest(storedProposal);
-        if (computedDigest !== receipt.proposalDigest) {
-          return reply.status(400).send({ error: `proposalDigest mismatch for dossier ${receipt.dossierId}` });
-        }
-
-        const isValidSignature = verifyReceiptSignature(receipt, evaluationId, inputDigest, evalData.verifier);
-        if (!isValidSignature) {
-          return reply.status(400).send({ error: `Invalid receipt signature for dossier ${receipt.dossierId}` });
-        }
-
-        outcomes.push({
-          dossierId: receipt.dossierId,
-          callId: receipt.callId,
-          action: receipt.action,
-          proposalDigest: receipt.proposalDigest,
-          receiptId: receipt.receiptId,
-          status: receipt.accepted ? 'executed' : 'rejected'
-        });
-      }
-
-      return reply.send({
-        profile: 'ga5-mailroom-action-gate/v2',
-        evaluationId,
-        status: 'completed',
-        inputDigest,
-        outcomes
-      });
+      proposals.push(proposal);
+      proposalsMap.set(dossier.dossierId, proposal);
     }
 
-    return reply.status(400).send({ error: `Unknown operation: ${operation}` });
+    EVALUATIONS.set(evaluationId, {
+      inputDigest,
+      verifier: receiptVerifier,
+      proposalsMap
+    });
+
+    return reply.status(200).send({
+      profile: 'ga5-mailroom-action-gate/v2',
+      evaluationId,
+      status: 'awaiting_receipts',
+      inputDigest,
+      proposals
+    });
   }
 
-  // Register on both endpoints
-  fastify.post('/v1/mailroom', handleMailroom);
-  fastify.post('/mailroom', handleMailroom);
+  // OPERATION 2: COMMIT
+  if (operation === 'commit') {
+    const { inputDigest, receipts } = body;
+
+    if (!EVALUATIONS.has(evaluationId)) {
+      return reply.status(400).send({ error: 'Unknown evaluationId' });
+    }
+
+    const evalData = EVALUATIONS.get(evaluationId);
+
+    if (evalData.inputDigest !== inputDigest) {
+      return reply.status(400).send({ error: 'Mismatch in inputDigest' });
+    }
+
+    if (!Array.isArray(receipts)) {
+      return reply.status(400).send({ error: 'Invalid receipts format' });
+    }
+
+    const outcomes = [];
+
+    for (const receipt of receipts) {
+      const storedProposal = evalData.proposalsMap.get(receipt.dossierId);
+
+      if (!storedProposal || storedProposal.callId !== receipt.callId || storedProposal.action !== receipt.action) {
+        return reply.status(400).send({ error: `Proposal mismatch for dossier ${receipt.dossierId}` });
+      }
+
+      const computedDigest = computeProposalDigest(storedProposal);
+      if (computedDigest !== receipt.proposalDigest) {
+        return reply.status(400).send({ error: `proposalDigest mismatch for dossier ${receipt.dossierId}` });
+      }
+
+      const isValidSignature = verifyReceiptSignature(receipt, evaluationId, inputDigest, evalData.verifier);
+      if (!isValidSignature) {
+        return reply.status(400).send({ error: `Invalid receipt signature for dossier ${receipt.dossierId}` });
+      }
+
+      outcomes.push({
+        dossierId: receipt.dossierId,
+        callId: receipt.callId,
+        action: receipt.action,
+        proposalDigest: receipt.proposalDigest,
+        receiptId: receipt.receiptId,
+        status: receipt.accepted ? 'executed' : 'rejected'
+      });
+    }
+
+    return reply.status(200).send({
+      profile: 'ga5-mailroom-action-gate/v2',
+      evaluationId,
+      status: 'completed',
+      inputDigest,
+      outcomes
+    });
+  }
+
+  return reply.status(400).send({ error: `Unknown operation: ${operation}` });
+}
+
+export async function q9MailroomRoutes(fastify, opts) {
+  // Direct route definitions guarantee route binding across fastify scopes
+  fastify.route({
+    method: 'POST',
+    url: '/v1/mailroom',
+    handler: handleMailroom
+  });
+
+  fastify.route({
+    method: 'POST',
+    url: '/mailroom',
+    handler: handleMailroom
+  });
 }
