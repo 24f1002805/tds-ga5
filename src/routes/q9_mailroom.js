@@ -1,6 +1,5 @@
 // src/routes/q9_mailroom.js
 import crypto from 'node:crypto';
-import fp from 'fastify-plugin';
 
 const EVALUATIONS = new Map();
 const DOSSIER_CACHE = new Map();
@@ -159,7 +158,7 @@ function processDossier(dossier) {
   };
 }
 
-async function mailroomPlugin(fastify, opts) {
+export async function q9MailroomRoutes(fastify, opts) {
   async function handleMailroom(req, reply) {
     reply.status(200).type('application/json');
     const body = req.body || {};
@@ -291,10 +290,7 @@ async function mailroomPlugin(fastify, opts) {
     return reply.status(400).send({ error: `Unknown operation: ${operation}` });
   }
 
-  // Register on both routes
+  // Register on both endpoints
   fastify.post('/v1/mailroom', handleMailroom);
   fastify.post('/mailroom', handleMailroom);
 }
-
-// Export as fastify-plugin to break isolation and register cleanly in index.js
-export const q9MailroomRoutes = fp(mailroomPlugin);
