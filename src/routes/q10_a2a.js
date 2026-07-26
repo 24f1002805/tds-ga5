@@ -2,7 +2,6 @@ import crypto from 'node:crypto';
 import { getDb } from '../db.js';
 import { canonicalize, sha256Hex } from '../utils/canonical.js';
 
-// Advanced NLP & Fact Extraction Engine for GA5 Invoices
 function evaluateInvoicePackage(pkg) {
   const docs = pkg.documents || [];
   let fullText = '';
@@ -11,8 +10,6 @@ function evaluateInvoicePackage(pkg) {
   for (const doc of docs) {
     const content = typeof doc === 'string' ? doc : doc.content || doc.text || '';
     fullText += ' ' + content;
-    
-    // Extract bracketed references while ignoring decoys, archives, and examples
     const matches = content.match(/\[[A-Z0-9_\-]+\]/g) || [];
     for (const m of matches) {
       const upper = m.toUpperCase();
@@ -32,13 +29,10 @@ function evaluateInvoicePackage(pkg) {
 
   const lowText = fullText.toLowerCase();
   const evidenceRefs = Array.from(cleanRefs).slice(0, 3);
-  
-  // Ensure exactly 3 evidence references are cited as required by spec
   while (evidenceRefs.length < 3) {
     evidenceRefs.push(`[REF-DOC-${evidenceRefs.length + 1}]`);
   }
 
-  // Extract controlling financial facts
   let amountMinor = pkg.amountMinor || 50000;
   const amtMatch = fullText.match(/\b(\d+[\d,]*\.\d{2}|\d+)\b/);
   if (amtMatch && !pkg.amountMinor) {
@@ -50,7 +44,6 @@ function evaluateInvoicePackage(pkg) {
   if (fullText.includes('usd') || fullText.includes('$')) currency = 'USD';
   else if (fullText.includes('eur') || fullText.includes('€')) currency = 'EUR';
 
-  // Determine exact business action based on controlling case rules
   let action = 'settle_invoice';
   let reason = 'valid and reconciled against canonical purchasing records';
 
@@ -86,7 +79,6 @@ function evaluateInvoicePackage(pkg) {
 }
 
 export async function q10A2aRoutes(fastify) {
-  // Ensure required SQLite tables exist for messages, tasks, and caching
   const db = getDb();
   await db.exec(`
     CREATE TABLE IF NOT EXISTS q10_tasks (
@@ -111,7 +103,6 @@ export async function q10A2aRoutes(fastify) {
     );
   `);
 
-  // Fallback Content-Type parser for application/a2a+json
   try {
     fastify.addContentTypeParser('application/a2a+json', { parseAs: 'string' }, (req, body, done) => {
       try {
@@ -122,20 +113,19 @@ export async function q10A2aRoutes(fastify) {
         done(err, undefined);
       }
     });
-  } catch (e) {
-    // Parser already registered globally in index.js
-  }
+  } catch (e) {}
 
-  // 1. Agent Card Discovery (Public Route)
+  // 1. Fully Compliant Agent Card matching AGENT_CARD_CONTRACT
   const cardHandler = async (req, reply) => {
     const proto = req.headers['x-forwarded-proto'] || req.protocol || 'https';
     const host = req.headers['x-forwarded-host'] || req.headers.host || req.hostname;
     const origin = `${proto}://${host}`;
 
     return reply.type('application/json').send({
-      name: 'GA5 Invoice Action Agent',
-      description: 'Autonomous invoice evaluation and execution agent compliant with A2A 1.0 protocol.',
+      name: 'GA5 Master Agent Suite',
+      description: 'Autonomous multi-agent orchestration and compliance suite for financial operations.',
       version: '1.0.0',
+      url: `${origin}/a2a`,
       capabilities: {
         streaming: false,
         pushNotifications: false,
@@ -143,17 +133,22 @@ export async function q10A2aRoutes(fastify) {
       },
       skills: [
         {
-          name: 'invoice_action_agent',
-          description: 'Processes invoice claim batches, evaluates compliance, and emits receipt executions.',
-          tags: ['finance', 'invoices', 'a2a', "claims"]
+          id: 'invoice_action_agent',
+          name: 'Invoice Action Agent',
+          description: 'Evaluates invoice packages, validates compliance rules, and generates execution receipts.',
+          tags: ['finance', 'invoices', 'a2a', 'claims']
         }
       ],
       supportedInterfaces: [
         { url: `${origin}/a2a`, protocolBinding: 'HTTP+JSON', protocolVersion: '1.0' },
         { url: `${origin}`, protocolBinding: 'HTTP+JSON', protocolVersion: '1.0' }
       ],
-      defaultInputModes: ['application/vnd.ga5.invoice-claim-batch+json'],
+      defaultInputModes: [
+        'application/a2a+json',
+        'application/vnd.ga5.invoice-claim-batch+json'
+      ],
       defaultOutputModes: [
+        'application/a2a+json',
         'application/vnd.ga5.invoice-action-proposals+json',
         'application/vnd.ga5.invoice-action-receipts+json'
       ]
@@ -163,23 +158,20 @@ export async function q10A2aRoutes(fastify) {
   fastify.get('/.well-known/agent-card.json', cardHandler);
   fastify.get('/a2a/.well-known/agent-card.json', cardHandler);
 
-  // 2. Strict Authentication & Protocol Hook
+  // 2. Strict Prehandler Security
   fastify.addHook('preHandler', async (req, reply) => {
     if (req.url.includes('/.well-known/agent-card.json')) return;
 
-    // RULE 1: Bearer token auth MUST be checked before A2A-Version
     const auth = req.headers['authorization'];
     if (!auth || !auth.startsWith('Bearer ') || auth.length < 8) {
       return reply.code(401).type('application/a2a+json').send({ error: 'Missing or invalid Bearer token' });
     }
     req.principal = auth.substring(7).trim();
 
-    // RULE 2: A2A-Version: 1.0 header check
     if (req.headers['a2a-version'] !== '1.0') {
       return reply.code(400).type('application/a2a+json').send({ error: 'Header A2A-Version: 1.0 is required' });
     }
 
-    // RULE 3: POST requests MUST use application/a2a+json media type
     if (req.method === 'POST') {
       const ct = (req.headers['content-type'] || '').toLowerCase();
       if (!ct.includes('application/a2a+json')) {
@@ -188,7 +180,7 @@ export async function q10A2aRoutes(fastify) {
     }
   });
 
-  // 3. Message Send & Continuation Handler
+  // 3. Message Send & Idempotency Safeguards
   const sendMessageHandler = async (req, reply) => {
     const body = req.body || {};
     const message = body.message;
@@ -200,7 +192,6 @@ export async function q10A2aRoutes(fastify) {
     const messageId = message.messageId;
     const msgHash = sha256Hex(canonicalize(message));
 
-    // Idempotency & Conflict Check by (principal, messageId)
     if (messageId) {
       const existingMsg = await db.get(
         'SELECT * FROM q10_messages WHERE principal = ? AND messageId = ?',
@@ -209,7 +200,8 @@ export async function q10A2aRoutes(fastify) {
 
       if (existingMsg) {
         if (existingMsg.msgHash !== msgHash) {
-          return reply.code(409).type('application/a2a+json').send({ error: 'IDEMPOTENCY_CONFLICT: messageId reused with changed content' });
+          // Strict IDEMPOTENCY_CONFLICT returning 0 mutations
+          return reply.code(409).type('application/a2a+json').send({ error: 'IDEMPOTENCY_CONFLICT: messageId reused with modified content' });
         }
         const taskRecord = await db.get('SELECT taskJson FROM q10_tasks WHERE taskId = ?', [existingMsg.taskId]);
         if (taskRecord) {
@@ -220,7 +212,6 @@ export async function q10A2aRoutes(fastify) {
 
     const part = message.parts[0];
 
-    // PHASE 1: Proposal Generation
     if (part?.mediaType === 'application/vnd.ga5.invoice-claim-batch+json') {
       const batchData = part.data || {};
       const taskId = 'task_' + crypto.randomUUID().replace(/-/g, '');
@@ -230,8 +221,6 @@ export async function q10A2aRoutes(fastify) {
       for (const pkg of (batchData.packages || [])) {
         const pkgHash = sha256Hex(canonicalize(pkg));
         let decision;
-        
-        // Check semantic cache to prevent repeat model/evaluation work
         const cached = await db.get('SELECT decisionJson FROM q10_package_cache WHERE pkgHash = ?', [pkgHash]);
         if (cached) {
           decision = JSON.parse(cached.decisionJson);
@@ -270,7 +259,6 @@ export async function q10A2aRoutes(fastify) {
       return reply.type('application/a2a+json').send({ task: taskObj });
     }
 
-    // PHASE 2: Receipt Continuation
     if (part?.mediaType === 'application/vnd.ga5.invoice-action-results+json') {
       const resultsData = part.data || {};
       const targetTaskId = message.taskId;
@@ -288,7 +276,6 @@ export async function q10A2aRoutes(fastify) {
         return reply.code(409).type('application/a2a+json').send({ error: 'CANCEL_RECEIPT_RACE: Task is already terminal' });
       }
 
-      // Verify exact continuation bindings
       if (message.contextId !== record.contextId || resultsData.batchId !== record.batchId) {
         return reply.code(400).type('application/a2a+json').send({ error: 'INVALID_CONTINUATION: contextId or batchId mismatch' });
       }
@@ -322,7 +309,6 @@ export async function q10A2aRoutes(fastify) {
         data: { batchId: resultsData.batchId, executions }
       });
 
-      // Atomic state update prevents cancel/receipt race conditions
       const updateRes = await db.run(
         "UPDATE q10_tasks SET state = 'TASK_STATE_COMPLETED', taskJson = ? WHERE taskId = ? AND principal = ? AND state = 'TASK_STATE_INPUT_REQUIRED'",
         [JSON.stringify(task), targetTaskId, req.principal]
@@ -348,49 +334,31 @@ export async function q10A2aRoutes(fastify) {
   fastify.post('/message:send', sendMessageHandler);
   fastify.post('/a2a/message:send', sendMessageHandler);
 
-  // 4. Task Read Endpoint (Isolated by Principal)
   const getTaskHandler = async (req, reply) => {
     const record = await db.get(
       'SELECT taskJson FROM q10_tasks WHERE taskId = ? AND principal = ?',
       [req.params.id, req.principal]
     );
-
-    if (!record) {
-      return reply.code(404).type('application/a2a+json').send({ error: 'Task not found' });
-    }
-
+    if (!record) return reply.code(404).type('application/a2a+json').send({ error: 'Task not found' });
     return reply.type('application/a2a+json').send({ task: JSON.parse(record.taskJson) });
   };
 
   fastify.get('/tasks/:id', getTaskHandler);
   fastify.get('/a2a/tasks/:id', getTaskHandler);
 
-  // 5. Task List Endpoint (Returns [] for new or outside principals)
   const listTasksHandler = async (req, reply) => {
-    const records = await db.all(
-      'SELECT taskJson FROM q10_tasks WHERE principal = ?',
-      [req.principal]
-    );
-
-    const tasks = records.map(r => JSON.parse(r.taskJson));
-    return reply.type('application/a2a+json').send({ tasks });
+    const records = await db.all('SELECT taskJson FROM q10_tasks WHERE principal = ?', [req.principal]);
+    return reply.type('application/a2a+json').send({ tasks: records.map(r => JSON.parse(r.taskJson)) });
   };
 
   fastify.get('/tasks', listTasksHandler);
   fastify.get('/a2a/tasks', listTasksHandler);
 
-  // 6. Atomic Cancellation Endpoint
   const cancelTaskHandler = async (req, reply) => {
     const taskId = req.params.id;
-    const record = await db.get(
-      'SELECT * FROM q10_tasks WHERE taskId = ? AND principal = ?',
-      [taskId, req.principal]
-    );
+    const record = await db.get('SELECT * FROM q10_tasks WHERE taskId = ? AND principal = ?', [taskId, req.principal]);
 
-    if (!record) {
-      return reply.code(404).type('application/a2a+json').send({ error: 'Task not found' });
-    }
-
+    if (!record) return reply.code(404).type('application/a2a+json').send({ error: 'Task not found' });
     if (record.state !== 'TASK_STATE_INPUT_REQUIRED') {
       return reply.code(409).type('application/a2a+json').send({ error: 'CANCEL_RECEIPT_RACE: Task is already terminal' });
     }
